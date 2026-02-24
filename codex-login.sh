@@ -88,21 +88,79 @@ json_get_num() {
     echo "$json" | grep -o "\"$key\"[[:space:]]*:[[:space:]]*[0-9]*" | head -1 | grep -o '[0-9]*$'
 }
 
-# Unix 时间戳转 ISO 8601
-timestamp_to_iso() {
-    local ts="$1"
+# 从嵌套 JSON 中提取字段（支持 tokens.access_token 这样的路径）
+json_get_nested() {
+    local json="$1" path="$2"
+    if command -v jq &>/dev/null; then
+        echo "$json" | jq -r ".$path // empty"
+        return
+    fi
     if command -v python3 &>/dev/null; then
-        python3 -c "from datetime import datetime,timezone; print(datetime.fromtimestamp($ts, tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))"
-    elif date --version &>/dev/null 2>&1; then
-        # GNU date
-        date -u -d "@$ts" '+%Y-%m-%dT%H:%M:%SZ'
+        python3 -c "
+import json, sys
+d = json.loads(sys.stdin.read())
+keys = '$path'.split('.')
+for k in keys:
+    if isinstance(d, dict):
+        d = d.get(k, '')
+    else:
+        d = ''
+        break
+print(d if d else '')
+" <<< "$json"
+        return
+    fi
+    # 简单的 fallback，只支持一层嵌套
+    echo "$json" | grep -o "\"${path##*.}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 | sed 's/.*"'${path##*.}'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/'
+}
+
+# 解码 JWT 并提取 account_id
+extract_account_id() {
+    local token="$1"
+    if command -v python3 &>/dev/null; then
+        python3 -c "
+import json, base64, sys
+try:
+    parts = '$token'.split('.')
+    if len(parts) != 3:
+        sys.exit(1)
+    payload = parts[1]
+    # 添加必要的填充
+    padding = len(payload) % 4
+    if padding:
+        payload += '=' * (4 - padding)
+    decoded = base64.urlsafe_b64decode(payload).decode('utf-8')
+    data = json.loads(decoded)
+    account_id = data.get('https://api.openai.com/auth', {}).get('chatgpt_account_id', '')
+    print(account_id)
+except:
+    pass
+"
     else
-        # BSD date (macOS)
-        date -u -r "$ts" '+%Y-%m-%dT%H:%M:%SZ'
+        # Fallback: 使用 openssl 和 sed
+        local payload=$(echo "$token" | cut -d. -f2)
+        # 添加 base64 填充
+        local padding=$((4 - ${#payload} % 4))
+        [[ $padding -ne 4 ]] && payload="${payload}$(printf '=%.0s' $(seq 1 $padding))"
+        # 解码并提取 account_id
+        echo "$payload" | base64 -d 2>/dev/null | grep -o '"chatgpt_account_id":"[^"]*"' | cut -d'"' -f4
     fi
 }
 
-# ── Codex CLI 检测与安装 ──────────────────────────────
+json_get_num() {
+    local json="$1" key="$2"
+    if command -v jq &>/dev/null; then
+        echo "$json" | jq -r ".$key // 0"
+        return
+    fi
+    if command -v python3 &>/dev/null; then
+        python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('$key',0))" <<< "$json"
+        return
+    fi
+    echo "$json" | grep -o "\"$key\"[[:space:]]*:[[:space:]]*[0-9]*" | head -1 | grep -o '[0-9]*$'
+}
+
+# 解码 JWT 并提取 account_id
 ensure_codex_cli() {
     if command -v codex &>/dev/null; then
         local version
@@ -212,7 +270,7 @@ do_login() {
 
     ACCESS_TOKEN=$(json_get "$RESPONSE" "access_token")
     REFRESH_TOKEN=$(json_get "$RESPONSE" "refresh_token")
-    EXPIRES_IN=$(json_get_num "$RESPONSE" "expires_in")
+    ID_TOKEN=$(json_get "$RESPONSE" "id_token")
 
     if [[ -z "$ACCESS_TOKEN" || "$ACCESS_TOKEN" == "null" ]]; then
         error "Token 换取失败"
@@ -220,16 +278,17 @@ do_login() {
         exit 1
     fi
 
-    EXPIRES_AT=$(( $(date +%s) + EXPIRES_IN ))
+    # 从 access_token JWT 中提取 account_id
+    ACCOUNT_ID=$(extract_account_id "$ACCESS_TOKEN")
 
     # 5. 保存到 Codex CLI 配置目录
-    save_codex_auth "$ACCESS_TOKEN" "$REFRESH_TOKEN" "$EXPIRES_AT"
+    save_codex_auth "$ID_TOKEN" "$ACCESS_TOKEN" "$REFRESH_TOKEN" "$ACCOUNT_ID"
 
     info "登录成功！"
     echo ""
     echo "  access_token:  ${ACCESS_TOKEN:0:20}...${ACCESS_TOKEN: -20}"
     echo "  refresh_token: ${REFRESH_TOKEN:0:20}...${REFRESH_TOKEN: -20}"
-    echo "  过期时间:      $(timestamp_to_iso "$EXPIRES_AT")"
+    [[ -n "$ACCOUNT_ID" ]] && echo "  account_id:    ${ACCOUNT_ID}"
     echo "  保存位置:      ${CODEX_AUTH_FILE}"
     echo ""
     info "Codex CLI 已就绪，直接运行 'codex' 即可使用"
@@ -248,7 +307,7 @@ do_refresh() {
     fi
 
     TOKEN_JSON=$(cat "$CODEX_AUTH_FILE")
-    REFRESH_TOKEN=$(json_get "$TOKEN_JSON" "refresh_token")
+    REFRESH_TOKEN=$(json_get_nested "$TOKEN_JSON" "tokens.refresh_token")
 
     if [[ -z "$REFRESH_TOKEN" ]]; then
         error "无 refresh_token，请重新登录: $0 login"
@@ -265,7 +324,7 @@ do_refresh() {
 
     ACCESS_TOKEN=$(json_get "$RESPONSE" "access_token")
     NEW_REFRESH=$(json_get "$RESPONSE" "refresh_token")
-    EXPIRES_IN=$(json_get_num "$RESPONSE" "expires_in")
+    ID_TOKEN=$(json_get "$RESPONSE" "id_token")
 
     if [[ -z "$ACCESS_TOKEN" || "$ACCESS_TOKEN" == "null" ]]; then
         error "Token 刷新失败"
@@ -274,12 +333,15 @@ do_refresh() {
     fi
 
     [[ -z "$NEW_REFRESH" || "$NEW_REFRESH" == "null" ]] && NEW_REFRESH="$REFRESH_TOKEN"
+    [[ -z "$ID_TOKEN" || "$ID_TOKEN" == "null" ]] && ID_TOKEN=$(json_get_nested "$TOKEN_JSON" "tokens.id_token")
 
-    EXPIRES_AT=$(( $(date +%s) + EXPIRES_IN ))
-    save_codex_auth "$ACCESS_TOKEN" "$NEW_REFRESH" "$EXPIRES_AT"
+    # 从 access_token JWT 中提取 account_id
+    ACCOUNT_ID=$(extract_account_id "$ACCESS_TOKEN")
+    [[ -z "$ACCOUNT_ID" ]] && ACCOUNT_ID=$(json_get_nested "$TOKEN_JSON" "tokens.account_id")
+
+    save_codex_auth "$ID_TOKEN" "$ACCESS_TOKEN" "$NEW_REFRESH" "$ACCOUNT_ID"
 
     info "Token 刷新成功！"
-    echo "  过期时间: $(timestamp_to_iso "$EXPIRES_AT")"
 }
 
 # ── 查看状态 ──────────────────────────────────────────
@@ -301,37 +363,19 @@ do_status() {
     fi
 
     TOKEN_JSON=$(cat "$CODEX_AUTH_FILE")
-    ACCESS_TOKEN=$(json_get "$TOKEN_JSON" "access_token")
-    EXPIRES_AT_ISO=$(json_get "$TOKEN_JSON" "expires_at")
-
-    # ISO 8601 转 unix timestamp
-    local expires_ts now
-    now=$(date +%s)
-    if command -v python3 &>/dev/null; then
-        expires_ts=$(python3 -c "from datetime import datetime; print(int(datetime.fromisoformat('${EXPIRES_AT_ISO}'.replace('Z','+00:00')).timestamp()))" 2>/dev/null || echo 0)
-    elif date --version &>/dev/null 2>&1; then
-        expires_ts=$(date -d "$EXPIRES_AT_ISO" +%s 2>/dev/null || echo 0)
-    else
-        expires_ts=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$EXPIRES_AT_ISO" +%s 2>/dev/null || echo 0)
-    fi
+    ACCESS_TOKEN=$(json_get_nested "$TOKEN_JSON" "tokens.access_token")
+    ACCOUNT_ID=$(json_get_nested "$TOKEN_JSON" "tokens.account_id")
 
     echo ""
     bold "Codex Token 状态"
     echo ""
     echo "  文件:          ${CODEX_AUTH_FILE}"
     echo "  access_token:  ${ACCESS_TOKEN:0:20}...${ACCESS_TOKEN: -20}"
-    echo "  过期时间:      ${EXPIRES_AT_ISO}"
-
-    if [[ "$expires_ts" -gt "$now" ]]; then
-        local remaining hours mins
-        remaining=$(( expires_ts - now ))
-        hours=$(( remaining / 3600 ))
-        mins=$(( (remaining % 3600) / 60 ))
-        info "状态: 有效 (剩余 ${hours}h ${mins}m)"
-    else
-        error "状态: 已过期"
-        echo "  运行 '$0 refresh' 刷新 token"
-    fi
+    [[ -n "$ACCOUNT_ID" ]] && echo "  account_id:    ${ACCOUNT_ID}"
+    info "状态: 已登录"
+    echo ""
+    echo "  提示: Codex CLI 使用自动刷新机制，无需手动检查过期时间"
+    echo "  运行 '$0 refresh' 可手动刷新 token"
     echo ""
 }
 
@@ -343,15 +387,12 @@ do_token() {
     fi
 
     TOKEN_JSON=$(cat "$CODEX_AUTH_FILE")
-    json_get "$TOKEN_JSON" "access_token"
+    json_get_nested "$TOKEN_JSON" "tokens.access_token"
 }
 
 # ── 保存 Token 到 Codex CLI 格式 ─────────────────────
 save_codex_auth() {
-    local access_token="$1" refresh_token="$2" expires_at_ts="$3"
-    local expires_at_iso
-
-    expires_at_iso=$(timestamp_to_iso "$expires_at_ts")
+    local id_token="$1" access_token="$2" refresh_token="$3" account_id="$4"
 
     # 确保目录存在
     mkdir -p "$CODEX_HOME"
@@ -359,25 +400,33 @@ save_codex_auth() {
     if command -v python3 &>/dev/null; then
         python3 -c "
 import json, sys
-d = {
-    'access_token': sys.argv[1],
-    'refresh_token': sys.argv[2],
-    'expires_at': sys.argv[3]
+tokens = {
+    'id_token': sys.argv[1],
+    'access_token': sys.argv[2],
+    'refresh_token': sys.argv[3]
 }
+if sys.argv[4]:
+    tokens['account_id'] = sys.argv[4]
+d = {'tokens': tokens}
 print(json.dumps(d, indent=2))
-" "$access_token" "$refresh_token" "$expires_at_iso" > "$CODEX_AUTH_FILE"
+" "$id_token" "$access_token" "$refresh_token" "$account_id" > "$CODEX_AUTH_FILE"
     elif command -v jq &>/dev/null; then
         jq -n \
+            --arg it "$id_token" \
             --arg at "$access_token" \
             --arg rt "$refresh_token" \
-            --arg ea "$expires_at_iso" \
-            '{access_token: $at, refresh_token: $rt, expires_at: $ea}' > "$CODEX_AUTH_FILE"
+            --arg aid "$account_id" \
+            '{tokens: {id_token: $it, access_token: $at, refresh_token: $rt} + (if $aid != "" then {account_id: $aid} else {} end)}' > "$CODEX_AUTH_FILE"
     else
+        # Fallback: 手动构建 JSON
         cat > "$CODEX_AUTH_FILE" <<JSONEOF
 {
-  "access_token": "$access_token",
-  "refresh_token": "$refresh_token",
-  "expires_at": "$expires_at_iso"
+  "tokens": {
+    "id_token": "$id_token",
+    "access_token": "$access_token",
+    "refresh_token": "$refresh_token"$(if [[ -n "$account_id" ]]; then echo ",
+    \"account_id\": \"$account_id\""; fi)
+  }
 }
 JSONEOF
     fi
