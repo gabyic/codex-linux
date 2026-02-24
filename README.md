@@ -34,6 +34,9 @@ sudo chmod +x /usr/local/bin/codex-login
 
 ```bash
 ./codex-login.sh login
+
+# 全局安装后
+codex-login login
 ```
 
 脚本会自动：
@@ -50,18 +53,21 @@ sudo chmod +x /usr/local/bin/codex-login
 
 ```bash
 ./codex-login.sh status
+codex-login status        # 全局安装
 ```
 
 #### 刷新 Token
 
 ```bash
 ./codex-login.sh refresh
+codex-login refresh       # 全局安装
 ```
 
 #### 获取 Token
 
 ```bash
 ./codex-login.sh token
+codex-login token         # 全局安装
 ```
 
 ### 原理
@@ -106,6 +112,9 @@ sudo chmod +x /usr/local/bin/codex-login
 
 ```bash
 ./codex-login.sh login
+
+# After global install
+codex-login login
 ```
 
 The script will automatically:
@@ -122,18 +131,21 @@ The script will automatically:
 
 ```bash
 ./codex-login.sh status
+codex-login status        # global install
 ```
 
 #### Refresh Token
 
 ```bash
 ./codex-login.sh refresh
+codex-login refresh       # global install
 ```
 
 #### Get Token
 
 ```bash
 ./codex-login.sh token
+codex-login token         # global install
 ```
 
 ### How It Works
