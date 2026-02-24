@@ -394,6 +394,14 @@ do_token() {
 save_codex_auth() {
     local id_token="$1" access_token="$2" refresh_token="$3" account_id="$4"
 
+    # 生成 last_refresh 时间戳（ISO 8601 带微秒）
+    local last_refresh
+    if command -v python3 &>/dev/null; then
+        last_refresh=$(python3 -c "from datetime import datetime,timezone; print(datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z')" 2>/dev/null)
+    else
+        last_refresh=$(date -u '+%Y-%m-%dT%H:%M:%S.000000Z')
+    fi
+
     # 确保目录存在
     mkdir -p "$CODEX_HOME"
 
@@ -407,26 +415,34 @@ tokens = {
 }
 if sys.argv[4]:
     tokens['account_id'] = sys.argv[4]
-d = {'tokens': tokens}
+d = {
+    'auth_mode': 'chatgpt',
+    'OPENAI_API_KEY': None,
+    'tokens': tokens,
+    'last_refresh': sys.argv[5]
+}
 print(json.dumps(d, indent=2))
-" "$id_token" "$access_token" "$refresh_token" "$account_id" > "$CODEX_AUTH_FILE"
+" "$id_token" "$access_token" "$refresh_token" "$account_id" "$last_refresh" > "$CODEX_AUTH_FILE"
     elif command -v jq &>/dev/null; then
         jq -n \
             --arg it "$id_token" \
             --arg at "$access_token" \
             --arg rt "$refresh_token" \
             --arg aid "$account_id" \
-            '{tokens: {id_token: $it, access_token: $at, refresh_token: $rt} + (if $aid != "" then {account_id: $aid} else {} end)}' > "$CODEX_AUTH_FILE"
+            --arg lr "$last_refresh" \
+            '{auth_mode: "chatgpt", OPENAI_API_KEY: null, tokens: ({id_token: $it, access_token: $at, refresh_token: $rt} + (if $aid != "" then {account_id: $aid} else {} end)), last_refresh: $lr}' > "$CODEX_AUTH_FILE"
     else
-        # Fallback: 手动构建 JSON
         cat > "$CODEX_AUTH_FILE" <<JSONEOF
 {
+  "auth_mode": "chatgpt",
+  "OPENAI_API_KEY": null,
   "tokens": {
     "id_token": "$id_token",
     "access_token": "$access_token",
     "refresh_token": "$refresh_token"$(if [[ -n "$account_id" ]]; then echo ",
     \"account_id\": \"$account_id\""; fi)
-  }
+  },
+  "last_refresh": "$last_refresh"
 }
 JSONEOF
     fi
