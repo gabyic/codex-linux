@@ -11,7 +11,8 @@ AUTHORIZE_URL="https://auth.openai.com/oauth/authorize"
 TOKEN_URL="https://auth.openai.com/oauth/token"
 REDIRECT_URI="http://localhost:1455/auth/callback"
 SCOPE="openid profile email offline_access"
-TOKEN_FILE="${CODEX_TOKEN_FILE:-$HOME/.codex-token.json}"
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+CODEX_AUTH_FILE="${CODEX_HOME}/auth.json"
 
 # ── 颜色 ──────────────────────────────────────────────
 RED='\033[0;31m'
@@ -41,7 +42,11 @@ check_deps() {
 
 # URL 安全的 base64 编码（去掉 = 填充，替换 +/ 为 -_）
 base64url_encode() {
-    base64 -w0 | tr '+/' '-_' | tr -d '='
+    if base64 -w0 </dev/null &>/dev/null; then
+        base64 -w0 | tr '+/' '-_' | tr -d '='
+    else
+        base64 | tr -d '\n' | tr '+/' '-_' | tr -d '='
+    fi
 }
 
 # 生成随机字符串
@@ -59,17 +64,14 @@ urlencode() {
 # 从 JSON 中提取字段（不依赖 jq）
 json_get() {
     local json="$1" key="$2"
-    # 尝试 jq
     if command -v jq &>/dev/null; then
         echo "$json" | jq -r ".$key // empty"
         return
     fi
-    # 尝试 python3
     if command -v python3 &>/dev/null; then
         python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('$key',''))" <<< "$json"
         return
     fi
-    # 最后用 grep（简单场景）
     echo "$json" | grep -o "\"$key\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 | sed 's/.*"'$key'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/'
 }
 
@@ -86,6 +88,59 @@ json_get_num() {
     echo "$json" | grep -o "\"$key\"[[:space:]]*:[[:space:]]*[0-9]*" | head -1 | grep -o '[0-9]*$'
 }
 
+# Unix 时间戳转 ISO 8601
+timestamp_to_iso() {
+    local ts="$1"
+    if command -v python3 &>/dev/null; then
+        python3 -c "from datetime import datetime,timezone; print(datetime.fromtimestamp($ts, tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))"
+    elif date --version &>/dev/null 2>&1; then
+        # GNU date
+        date -u -d "@$ts" '+%Y-%m-%dT%H:%M:%SZ'
+    else
+        # BSD date (macOS)
+        date -u -r "$ts" '+%Y-%m-%dT%H:%M:%SZ'
+    fi
+}
+
+# ── Codex CLI 检测与安装 ──────────────────────────────
+ensure_codex_cli() {
+    if command -v codex &>/dev/null; then
+        local version
+        version=$(codex --version 2>/dev/null || echo "unknown")
+        info "Codex CLI 已安装 (${version})"
+        return 0
+    fi
+
+    warn "未检测到 Codex CLI"
+
+    # 检查 npm
+    if ! command -v npm &>/dev/null; then
+        # 检查 node
+        if ! command -v node &>/dev/null; then
+            warn "未检测到 Node.js，正在安装..."
+            if command -v apt &>/dev/null; then
+                curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash - && sudo apt install -y nodejs
+            elif command -v yum &>/dev/null; then
+                curl -fsSL https://rpm.nodesource.com/setup_lts.x | sudo bash - && sudo yum install -y nodejs
+            else
+                error "无法自动安装 Node.js，请手动安装后重试"
+                echo "  https://nodejs.org/en/download/"
+                exit 1
+            fi
+        fi
+    fi
+
+    info "正在安装 Codex CLI..."
+    npm install -g @openai/codex 2>&1 | tail -3
+
+    if command -v codex &>/dev/null; then
+        info "Codex CLI 安装成功"
+    else
+        error "Codex CLI 安装失败，请手动安装: npm install -g @openai/codex"
+        exit 1
+    fi
+}
+
 # ── PKCE ──────────────────────────────────────────────
 generate_pkce() {
     CODE_VERIFIER=$(random_string 64)
@@ -100,6 +155,10 @@ do_login() {
     bold "╔══════════════════════════════════════════╗"
     bold "║     Codex for Linux — OAuth 登录工具     ║"
     bold "╚══════════════════════════════════════════╝"
+    echo ""
+
+    # 0. 检测并安装 Codex CLI
+    ensure_codex_cli
     echo ""
 
     # 1. 生成 PKCE
@@ -163,30 +222,32 @@ do_login() {
 
     EXPIRES_AT=$(( $(date +%s) + EXPIRES_IN ))
 
-    # 5. 保存 token
-    save_token "$ACCESS_TOKEN" "$REFRESH_TOKEN" "$EXPIRES_AT"
+    # 5. 保存到 Codex CLI 配置目录
+    save_codex_auth "$ACCESS_TOKEN" "$REFRESH_TOKEN" "$EXPIRES_AT"
 
-    info "登录成功！Token 已保存到 ${TOKEN_FILE}"
+    info "登录成功！"
     echo ""
     echo "  access_token:  ${ACCESS_TOKEN:0:20}...${ACCESS_TOKEN: -20}"
     echo "  refresh_token: ${REFRESH_TOKEN:0:20}...${REFRESH_TOKEN: -20}"
-    echo "  过期时间:      $(date -d "@$EXPIRES_AT" 2>/dev/null || date -r "$EXPIRES_AT" 2>/dev/null || echo "$EXPIRES_AT")"
+    echo "  过期时间:      $(timestamp_to_iso "$EXPIRES_AT")"
+    echo "  保存位置:      ${CODEX_AUTH_FILE}"
     echo ""
-    info "使用 '$0 token' 获取 access_token"
+    info "Codex CLI 已就绪，直接运行 'codex' 即可使用"
     info "使用 '$0 refresh' 刷新 token"
+    info "使用 '$0 status' 查看 token 状态"
 }
 
 # ── 刷新 Token ────────────────────────────────────────
 do_refresh() {
     check_deps
 
-    if [[ ! -f "$TOKEN_FILE" ]]; then
-        error "未找到 token 文件: $TOKEN_FILE"
+    if [[ ! -f "$CODEX_AUTH_FILE" ]]; then
+        error "未找到 token 文件: ${CODEX_AUTH_FILE}"
         error "请先运行: $0 login"
         exit 1
     fi
 
-    TOKEN_JSON=$(cat "$TOKEN_FILE")
+    TOKEN_JSON=$(cat "$CODEX_AUTH_FILE")
     REFRESH_TOKEN=$(json_get "$TOKEN_JSON" "refresh_token")
 
     if [[ -z "$REFRESH_TOKEN" ]]; then
@@ -212,41 +273,61 @@ do_refresh() {
         exit 1
     fi
 
-    # refresh_token 可能更新也可能不变
     [[ -z "$NEW_REFRESH" || "$NEW_REFRESH" == "null" ]] && NEW_REFRESH="$REFRESH_TOKEN"
 
     EXPIRES_AT=$(( $(date +%s) + EXPIRES_IN ))
-    save_token "$ACCESS_TOKEN" "$NEW_REFRESH" "$EXPIRES_AT"
+    save_codex_auth "$ACCESS_TOKEN" "$NEW_REFRESH" "$EXPIRES_AT"
 
     info "Token 刷新成功！"
-    echo "  过期时间: $(date -d "@$EXPIRES_AT" 2>/dev/null || date -r "$EXPIRES_AT" 2>/dev/null || echo "$EXPIRES_AT")"
+    echo "  过期时间: $(timestamp_to_iso "$EXPIRES_AT")"
 }
 
 # ── 查看状态 ──────────────────────────────────────────
 do_status() {
-    if [[ ! -f "$TOKEN_FILE" ]]; then
-        warn "未登录 (未找到 ${TOKEN_FILE})"
+    # Codex CLI 状态
+    if command -v codex &>/dev/null; then
+        local version
+        version=$(codex --version 2>/dev/null || echo "unknown")
+        info "Codex CLI: 已安装 (${version})"
+    else
+        warn "Codex CLI: 未安装"
+    fi
+
+    # Token 状态
+    if [[ ! -f "$CODEX_AUTH_FILE" ]]; then
+        warn "Token: 未登录 (未找到 ${CODEX_AUTH_FILE})"
         echo "  运行 '$0 login' 开始登录"
         exit 0
     fi
 
-    TOKEN_JSON=$(cat "$TOKEN_FILE")
+    TOKEN_JSON=$(cat "$CODEX_AUTH_FILE")
     ACCESS_TOKEN=$(json_get "$TOKEN_JSON" "access_token")
-    EXPIRES_AT=$(json_get_num "$TOKEN_JSON" "expires_at")
-    NOW=$(date +%s)
+    EXPIRES_AT_ISO=$(json_get "$TOKEN_JSON" "expires_at")
+
+    # ISO 8601 转 unix timestamp
+    local expires_ts now
+    now=$(date +%s)
+    if command -v python3 &>/dev/null; then
+        expires_ts=$(python3 -c "from datetime import datetime; print(int(datetime.fromisoformat('${EXPIRES_AT_ISO}'.replace('Z','+00:00')).timestamp()))" 2>/dev/null || echo 0)
+    elif date --version &>/dev/null 2>&1; then
+        expires_ts=$(date -d "$EXPIRES_AT_ISO" +%s 2>/dev/null || echo 0)
+    else
+        expires_ts=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$EXPIRES_AT_ISO" +%s 2>/dev/null || echo 0)
+    fi
 
     echo ""
     bold "Codex Token 状态"
     echo ""
-    echo "  文件:          $TOKEN_FILE"
+    echo "  文件:          ${CODEX_AUTH_FILE}"
     echo "  access_token:  ${ACCESS_TOKEN:0:20}...${ACCESS_TOKEN: -20}"
+    echo "  过期时间:      ${EXPIRES_AT_ISO}"
 
-    if [[ "$EXPIRES_AT" -gt "$NOW" ]]; then
-        REMAINING=$(( EXPIRES_AT - NOW ))
-        HOURS=$(( REMAINING / 3600 ))
-        MINS=$(( (REMAINING % 3600) / 60 ))
-        info "状态: 有效（剩余 ${HOURS}h ${MINS}m）"
-        echo "  过期时间: $(date -d "@$EXPIRES_AT" 2>/dev/null || date -r "$EXPIRES_AT" 2>/dev/null || echo "$EXPIRES_AT")"
+    if [[ "$expires_ts" -gt "$now" ]]; then
+        local remaining hours mins
+        remaining=$(( expires_ts - now ))
+        hours=$(( remaining / 3600 ))
+        mins=$(( (remaining % 3600) / 60 ))
+        info "状态: 有效 (剩余 ${hours}h ${mins}m)"
     else
         error "状态: 已过期"
         echo "  运行 '$0 refresh' 刷新 token"
@@ -256,52 +337,52 @@ do_status() {
 
 # ── 输出 Token ────────────────────────────────────────
 do_token() {
-    if [[ ! -f "$TOKEN_FILE" ]]; then
+    if [[ ! -f "$CODEX_AUTH_FILE" ]]; then
         error "未登录" >&2
         exit 1
     fi
 
-    TOKEN_JSON=$(cat "$TOKEN_FILE")
-    EXPIRES_AT=$(json_get_num "$TOKEN_JSON" "expires_at")
-    NOW=$(date +%s)
-
-    # 自动刷新（过期前 60 秒）
-    if [[ "$EXPIRES_AT" -le $(( NOW + 60 )) ]]; then
-        warn "Token 即将过期，自动刷新..." >&2
-        do_refresh >&2
-        TOKEN_JSON=$(cat "$TOKEN_FILE")
-    fi
-
+    TOKEN_JSON=$(cat "$CODEX_AUTH_FILE")
     json_get "$TOKEN_JSON" "access_token"
 }
 
-# ── 保存 Token ────────────────────────────────────────
-save_token() {
-    local access_token="$1" refresh_token="$2" expires_at="$3"
+# ── 保存 Token 到 Codex CLI 格式 ─────────────────────
+save_codex_auth() {
+    local access_token="$1" refresh_token="$2" expires_at_ts="$3"
+    local expires_at_iso
+
+    expires_at_iso=$(timestamp_to_iso "$expires_at_ts")
+
+    # 确保目录存在
+    mkdir -p "$CODEX_HOME"
 
     if command -v python3 &>/dev/null; then
         python3 -c "
-import json
-d = {'access_token': '''$access_token''', 'refresh_token': '''$refresh_token''', 'expires_at': $expires_at}
+import json, sys
+d = {
+    'access_token': sys.argv[1],
+    'refresh_token': sys.argv[2],
+    'expires_at': sys.argv[3]
+}
 print(json.dumps(d, indent=2))
-" > "$TOKEN_FILE"
+" "$access_token" "$refresh_token" "$expires_at_iso" > "$CODEX_AUTH_FILE"
     elif command -v jq &>/dev/null; then
         jq -n \
             --arg at "$access_token" \
             --arg rt "$refresh_token" \
-            --argjson ea "$expires_at" \
-            '{access_token: $at, refresh_token: $rt, expires_at: $ea}' > "$TOKEN_FILE"
+            --arg ea "$expires_at_iso" \
+            '{access_token: $at, refresh_token: $rt, expires_at: $ea}' > "$CODEX_AUTH_FILE"
     else
-        cat > "$TOKEN_FILE" <<JSONEOF
+        cat > "$CODEX_AUTH_FILE" <<JSONEOF
 {
   "access_token": "$access_token",
   "refresh_token": "$refresh_token",
-  "expires_at": $expires_at
+  "expires_at": "$expires_at_iso"
 }
 JSONEOF
     fi
 
-    chmod 600 "$TOKEN_FILE"
+    chmod 600 "$CODEX_AUTH_FILE"
 }
 
 # ── 帮助 ──────────────────────────────────────────────
@@ -312,19 +393,18 @@ do_help() {
     echo "用法: $0 <命令>"
     echo ""
     echo "命令:"
-    echo "  login    登录 ChatGPT，获取 Codex API token"
+    echo "  login    检测/安装 Codex CLI，登录 ChatGPT 获取 token"
     echo "  refresh  刷新 access_token"
-    echo "  status   查看 token 状态"
-    echo "  token    输出 access_token（可用于管道）"
+    echo "  status   查看 Codex CLI 和 token 状态"
+    echo "  token    输出 access_token (可用于管道)"
     echo "  help     显示帮助"
     echo ""
     echo "示例:"
     echo "  $0 login                          # 登录"
-    echo "  $0 token                           # 获取 token"
-    echo '  curl -H "Authorization: Bearer $($0 token)" ...  # 配合 curl 使用'
+    echo "  $0 status                          # 查看状态"
+    echo "  codex                               # 登录后直接使用 Codex CLI"
     echo ""
-    echo "环境变量:"
-    echo "  CODEX_TOKEN_FILE  token 保存路径（默认: ~/.codex-token.json）"
+    echo "Token 保存位置: ${CODEX_AUTH_FILE}"
     echo ""
 }
 
